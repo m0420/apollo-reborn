@@ -101,8 +101,15 @@ static NSString *ApolloTagFilterDecisionForLink(RDKLink *link) {
     BOOL match = (isNSFW && filterNSFW) || (isSpoiler && filterSpoiler);
     if (!match) return @"none";
 
-    // Hide mode was removed; everything filtered now blurs.
-    return @"blur";
+    // Determine mode: per-subreddit override takes precedence over the global setting.
+    NSString *mode = sTagFilterMode ?: @"blur";
+    if ([override isKindOfClass:[NSDictionary class]]) {
+        id m = override[@"mode"];
+        if ([m isKindOfClass:[NSString class]] && ([m isEqualToString:@"hide"] || [m isEqualToString:@"blur"])) {
+            mode = m;
+        }
+    }
+    return mode;
 }
 
 // MARK: - Blur overlays (scoped to content subnodes)
@@ -539,9 +546,104 @@ static void ApolloTagRefreshAllVisibleCells(void) {
     });
 }
 
+// MARK: - Hide mode: layout collapse + separator tracking
+//
+// When mode is "hide", hook layoutSpecThatFits: to return a zero-size
+// ASStackLayoutSpec (same technique as ApolloPostFilters / CommunityHighlights).
+// Also collapse the trailing ThickSeparatorCellNode to avoid stacked 8pt gaps.
+
+struct ApolloTagSizeRange { CGSize min; CGSize max; };
+
+@interface ApolloTagStackSpecHelper : NSObject
++ (instancetype)stackLayoutSpecWithDirection:(NSInteger)direction
+                                      spacing:(CGFloat)spacing
+                               justifyContent:(NSUInteger)justifyContent
+                                   alignItems:(NSUInteger)alignItems
+                                     children:(NSArray *)children;
+@end
+
+static id ApolloTagEmptySpec(void) {
+    Class cls = objc_getClass("ASStackLayoutSpec");
+    if (!cls) return nil;
+    return [(ApolloTagStackSpecHelper *)cls stackLayoutSpecWithDirection:0 spacing:0 justifyContent:0 alignItems:0 children:@[]];
+}
+
+// Zero a node's fixed style heights so an empty spec actually collapses it.
+// ASDimension = { NSInteger unit; CGFloat value }.
+static void ApolloTagZeroNodeHeight(id node) {
+    id style = [node respondsToSelector:@selector(style)] ? ((id (*)(id, SEL))objc_msgSend)(node, @selector(style)) : nil;
+    if (!style) return;
+    typedef struct { NSInteger unit; CGFloat value; } ApolloTagDim;
+    ApolloTagDim zero = {1, 0.0}; // {ASDimensionUnitPoints, 0}
+    if ([style respondsToSelector:@selector(setHeight:)])    ((void (*)(id, SEL, ApolloTagDim))objc_msgSend)(style, @selector(setHeight:), zero);
+    if ([style respondsToSelector:@selector(setMinHeight:)]) ((void (*)(id, SEL, ApolloTagDim))objc_msgSend)(style, @selector(setMinHeight:), zero);
+    if ([style respondsToSelector:@selector(setMaxHeight:)]) ((void (*)(id, SEL, ApolloTagDim))objc_msgSend)(style, @selector(setMaxHeight:), zero);
+}
+
+static char kApolloTagHiddenRowsKey;
+static char kApolloTagSepDirtyKey;
+
+static id ApolloTagOwningTableNode(id cellNode) {
+    return [cellNode respondsToSelector:@selector(owningNode)] ? ((id (*)(id, SEL))objc_msgSend)(cellNode, @selector(owningNode)) : nil;
+}
+
+static NSInteger ApolloTagNodeRow(id cellNode) {
+    if (![cellNode respondsToSelector:@selector(indexPath)]) return -1;
+    NSIndexPath *ip = ((NSIndexPath *(*)(id, SEL))objc_msgSend)(cellNode, @selector(indexPath));
+    return ip ? ip.row : -1;
+}
+
+static NSMutableSet *ApolloTagHiddenRowsSet(id owningTable, BOOL create) {
+    if (!owningTable) return nil;
+    NSMutableSet *set = objc_getAssociatedObject(owningTable, &kApolloTagHiddenRowsKey);
+    if (!set && create) {
+        set = [NSMutableSet set];
+        objc_setAssociatedObject(owningTable, &kApolloTagHiddenRowsKey, set, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return set;
+}
+
+static void ApolloTagUpdateHiddenRow(id postNode, BOOL hidden) {
+    id owning = ApolloTagOwningTableNode(postNode);
+    NSInteger row = ApolloTagNodeRow(postNode);
+    if (!owning || row < 0) return;
+    BOOL changed = NO;
+    @synchronized(owning) {
+        NSMutableSet *set = ApolloTagHiddenRowsSet(owning, YES);
+        BOOL had = [set containsObject:@(row)];
+        if (hidden && !had) { [set addObject:@(row)]; changed = YES; }
+        else if (!hidden && had) { [set removeObject:@(row)]; changed = YES; }
+    }
+    if (changed) objc_setAssociatedObject(owning, &kApolloTagSepDirtyKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static BOOL ApolloTagSeparatorShouldCollapse(id sepNode) {
+    if (!sTagFilterEnabled) return NO;
+    NSInteger r = ApolloTagNodeRow(sepNode);
+    if (r < 1) return NO;
+    id owning = ApolloTagOwningTableNode(sepNode);
+    if (!owning) return NO;
+    @synchronized(owning) {
+        NSMutableSet *set = ApolloTagHiddenRowsSet(owning, NO);
+        return [set containsObject:@(r - 1)];
+    }
+}
+
 // MARK: - Cell hooks
 
 %hook _TtC6Apollo17LargePostCellNode
+
+- (id)layoutSpecThatFits:(struct ApolloTagSizeRange)constrainedSize {
+    RDKLink *link = ApolloTagLinkFromCell(self);
+    NSString *decision = ApolloTagFilterDecisionForLink(link);
+    BOOL hide = [decision isEqualToString:@"hide"];
+    ApolloTagUpdateHiddenRow(self, hide);
+    if (hide) {
+        id empty = ApolloTagEmptySpec();
+        if (empty) return empty;
+    }
+    return %orig;
+}
 
 - (void)didLoad {
     %orig;
@@ -567,6 +669,18 @@ static void ApolloTagRefreshAllVisibleCells(void) {
 
 %hook _TtC6Apollo19CompactPostCellNode
 
+- (id)layoutSpecThatFits:(struct ApolloTagSizeRange)constrainedSize {
+    RDKLink *link = ApolloTagLinkFromCell(self);
+    NSString *decision = ApolloTagFilterDecisionForLink(link);
+    BOOL hide = [decision isEqualToString:@"hide"];
+    ApolloTagUpdateHiddenRow(self, hide);
+    if (hide) {
+        id empty = ApolloTagEmptySpec();
+        if (empty) return empty;
+    }
+    return %orig;
+}
+
 - (void)didLoad {
     %orig;
     ApolloTagApplyDecisionToCell(self);
@@ -587,11 +701,44 @@ static void ApolloTagRefreshAllVisibleCells(void) {
 
 %end
 
+// Collapse the separator (8pt ThickSeparatorCellNode) that trails a hidden post,
+// so hidden NSFW/Spoiler rows don't leave stacked 8pt gaps in the feed.
+%hook _TtC6Apollo22ThickSeparatorCellNode
+
+- (id)calculateLayoutThatFits:(struct ApolloTagSizeRange)constrainedSize {
+    if (!ApolloTagSeparatorShouldCollapse(self)) return %orig;
+    ApolloTagZeroNodeHeight(self);
+    id layout = %orig;
+    if (layout) {
+        CGSize s = ((CGSize (*)(id, SEL))objc_msgSend)(layout, @selector(size));
+        if (s.height > 0.0) {
+            Class ASLayoutCls = objc_getClass("ASLayout");
+            if (ASLayoutCls) {
+                id zero = ((id (*)(id, SEL, id, CGSize))objc_msgSend)(ASLayoutCls, @selector(layoutWithLayoutElement:size:), self, CGSizeMake(s.width, 0.0));
+                if (zero) return zero;
+            }
+        }
+    }
+    return layout;
+}
+
+- (id)layoutSpecThatFits:(struct ApolloTagSizeRange)constrainedSize {
+    if (ApolloTagSeparatorShouldCollapse(self)) {
+        ApolloTagZeroNodeHeight(self);
+        id empty = ApolloTagEmptySpec();
+        if (empty) return empty;
+    }
+    return %orig;
+}
+
+%end
+
 // MARK: - Constructor
 
 %ctor {
     %init(_TtC6Apollo17LargePostCellNode = objc_getClass("_TtC6Apollo17LargePostCellNode"),
-          _TtC6Apollo19CompactPostCellNode = objc_getClass("_TtC6Apollo19CompactPostCellNode"));
+          _TtC6Apollo19CompactPostCellNode = objc_getClass("_TtC6Apollo19CompactPostCellNode"),
+          _TtC6Apollo22ThickSeparatorCellNode = objc_getClass("_TtC6Apollo22ThickSeparatorCellNode"));
 
     [[NSNotificationCenter defaultCenter] addObserverForName:ApolloTagFiltersChangedNotification
                                                       object:nil

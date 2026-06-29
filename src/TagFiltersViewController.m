@@ -67,7 +67,7 @@ typedef NS_ENUM(NSInteger, TagFiltersSection) {
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 3; }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    if (section == 0) return 2; // NSFW, Spoiler
+    if (section == 0) return 3; // NSFW, Spoiler, Mode
     if (section == 1) return 1; // Reset
     return 1;                   // Delete
 }
@@ -94,14 +94,44 @@ typedef NS_ENUM(NSInteger, TagFiltersSection) {
     return cell;
 }
 
+// Returns the effective mode string for this subreddit: override if set, else global.
+- (NSString *)effectiveMode {
+    NSDictionary *o = [self currentOverride];
+    id m = o[@"mode"];
+    if ([m isKindOfClass:[NSString class]] && ([m isEqualToString:@"hide"] || [m isEqualToString:@"blur"])) {
+        return m;
+    }
+    return sTagFilterMode ?: @"blur";
+}
+
+// YES if this subreddit has an explicit mode override (not just using global default).
+- (BOOL)hasModeOverride {
+    NSDictionary *o = [self currentOverride];
+    id m = o[@"mode"];
+    return [m isKindOfClass:[NSString class]] && ([m isEqualToString:@"hide"] || [m isEqualToString:@"blur"]);
+}
+
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     if (indexPath.section == 0) {
         if (indexPath.row == 0) return [self switchCellLabel:@"NSFW"
                                                           on:[self effectiveBoolForKey:@"nsfw" globalDefault:sTagFilterNSFW]
                                                       action:@selector(nsfwChanged:)];
-        return [self switchCellLabel:@"Spoiler"
-                                  on:[self effectiveBoolForKey:@"spoiler" globalDefault:sTagFilterSpoiler]
-                              action:@selector(spoilerChanged:)];
+        if (indexPath.row == 1) return [self switchCellLabel:@"Spoiler"
+                                                          on:[self effectiveBoolForKey:@"spoiler" globalDefault:sTagFilterSpoiler]
+                                                      action:@selector(spoilerChanged:)];
+        // Row 2: Mode override (3-segment: Default / Blur / Hide)
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        cell.textLabel.text = @"Mode";
+        UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"Default", @"Blur", @"Hide"]];
+        if (![self hasModeOverride]) {
+            seg.selectedSegmentIndex = 0; // Default (follow global)
+        } else {
+            seg.selectedSegmentIndex = [[self effectiveMode] isEqualToString:@"hide"] ? 2 : 1;
+        }
+        [seg addTarget:self action:@selector(overrideModeChanged:) forControlEvents:UIControlEventValueChanged];
+        cell.accessoryView = seg;
+        return cell;
     }
     if (indexPath.section == 1) {
         UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
@@ -123,6 +153,16 @@ typedef NS_ENUM(NSInteger, TagFiltersSection) {
 
 - (void)spoilerChanged:(UISwitch *)sw {
     [self updateOverrideWithBlock:^(NSMutableDictionary *o) { o[@"spoiler"] = @(sw.on); }];
+}
+
+- (void)overrideModeChanged:(UISegmentedControl *)seg {
+    [self updateOverrideWithBlock:^(NSMutableDictionary *o) {
+        if (seg.selectedSegmentIndex == 0) {
+            [o removeObjectForKey:@"mode"]; // Default: follow global
+        } else {
+            o[@"mode"] = (seg.selectedSegmentIndex == 2) ? @"hide" : @"blur";
+        }
+    }];
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -177,7 +217,7 @@ typedef NS_ENUM(NSInteger, TagFiltersSection) {
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return TagFiltersSectionCount; }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    if (section == TagFiltersSectionGeneral) return 3;  // Enable / NSFW / Spoiler
+    if (section == TagFiltersSectionGeneral) return 4;  // Enable / Mode / NSFW / Spoiler
     if (section == TagFiltersSectionOverrides) return [self overrideSubreddits].count + 1; // + "Add"
     return 0;
 }
@@ -190,7 +230,7 @@ typedef NS_ENUM(NSInteger, TagFiltersSection) {
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == TagFiltersSectionGeneral) {
-        return @"Filtered posts are covered with a frosted blur over the post's title and thumbnail. Tap the blur to confirm and reveal the post. Brand Affiliate is unavailable because Apollo does not store that tag.";
+        return @"Blur covers post titles and thumbnails with a frosted overlay — tap to confirm and reveal. Hide collapses the post entirely so it takes no space in the feed. Brand Affiliate is unavailable because Apollo does not store that tag.";
     }
     if (section == TagFiltersSectionOverrides) {
         return @"Per-subreddit settings override the global defaults. Add a subreddit to customize behavior for it.";
@@ -213,13 +253,27 @@ typedef NS_ENUM(NSInteger, TagFiltersSection) {
     return cell;
 }
 
+- (UITableViewCell *)modeCellForMode:(NSString *)mode enabled:(BOOL)enabled {
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    cell.textLabel.text = @"Mode";
+    cell.textLabel.enabled = enabled;
+    UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"Blur", @"Hide"]];
+    seg.selectedSegmentIndex = [mode isEqualToString:@"hide"] ? 1 : 0;
+    seg.enabled = enabled;
+    [seg addTarget:self action:@selector(modeChanged:) forControlEvents:UIControlEventValueChanged];
+    cell.accessoryView = seg;
+    return cell;
+}
+
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     if (indexPath.section == TagFiltersSectionGeneral) {
         switch (indexPath.row) {
             case 0:
                 return [self switchCellLabel:@"Enable Tag Filters" on:sTagFilterEnabled enabled:YES action:@selector(enableChanged:)];
-            case 1: return [self switchCellLabel:@"NSFW" on:sTagFilterNSFW enabled:sTagFilterEnabled action:@selector(nsfwChanged:)];
-            case 2: return [self switchCellLabel:@"Spoiler" on:sTagFilterSpoiler enabled:sTagFilterEnabled action:@selector(spoilerChanged:)];
+            case 1: return [self modeCellForMode:sTagFilterMode enabled:sTagFilterEnabled];
+            case 2: return [self switchCellLabel:@"NSFW" on:sTagFilterNSFW enabled:sTagFilterEnabled action:@selector(nsfwChanged:)];
+            case 3: return [self switchCellLabel:@"Spoiler" on:sTagFilterSpoiler enabled:sTagFilterEnabled action:@selector(spoilerChanged:)];
         }
     }
 
@@ -249,6 +303,7 @@ typedef NS_ENUM(NSInteger, TagFiltersSection) {
     NSMutableArray<NSString *> *parts = [NSMutableArray array];
     if ([o[@"nsfw"] isKindOfClass:[NSNumber class]]) [parts addObject:[NSString stringWithFormat:@"NSFW: %@", [o[@"nsfw"] boolValue] ? @"on" : @"off"]];
     if ([o[@"spoiler"] isKindOfClass:[NSNumber class]]) [parts addObject:[NSString stringWithFormat:@"Spoiler: %@", [o[@"spoiler"] boolValue] ? @"on" : @"off"]];
+    if ([o[@"mode"] isKindOfClass:[NSString class]]) [parts addObject:[NSString stringWithFormat:@"Mode: %@", o[@"mode"]]];
     if (parts.count == 0) return @"(uses global)";
     return [parts componentsJoinedByString:@" · "];
 }
@@ -260,6 +315,13 @@ typedef NS_ENUM(NSInteger, TagFiltersSection) {
     [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:UDKeyTagFilterEnabled];
     [self postChange];
     [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:TagFiltersSectionGeneral] withRowAnimation:UITableViewRowAnimationNone];
+}
+
+- (void)modeChanged:(UISegmentedControl *)seg {
+    NSString *mode = (seg.selectedSegmentIndex == 1) ? @"hide" : @"blur";
+    sTagFilterMode = mode;
+    [[NSUserDefaults standardUserDefaults] setObject:mode forKey:UDKeyTagFilterMode];
+    [self postChange];
 }
 
 - (void)nsfwChanged:(UISwitch *)sw {
