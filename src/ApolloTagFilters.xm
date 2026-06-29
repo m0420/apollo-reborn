@@ -565,7 +565,7 @@ struct ApolloTagSizeRange { CGSize min; CGSize max; };
 static id ApolloTagEmptySpec(void) {
     Class cls = objc_getClass("ASStackLayoutSpec");
     if (!cls) return nil;
-    return [(ApolloTagStackSpecHelper *)cls stackLayoutSpecWithDirection:0 spacing:0 justifyContent:0 alignItems:0 children:@[]];
+    return [(id)cls stackLayoutSpecWithDirection:0 spacing:0 justifyContent:0 alignItems:0 children:@[]];
 }
 
 // Zero a node's fixed style heights so an empty spec actually collapses it.
